@@ -20,6 +20,7 @@
 #ifndef _KPATCH_ELF_H_
 #define _KPATCH_ELF_H_
 
+#include <stdbool.h>
 #include <gelf.h>
 #include "list.h"
 #include "log.h"
@@ -49,7 +50,7 @@ struct section {
 	GElf_Shdr sh;
 	Elf_Data *data;
 	char *name;
-	int index;
+	unsigned int index;
 	enum status status;
 	int include;
 	int ignore;
@@ -72,7 +73,7 @@ struct symbol {
 	struct section *sec;
 	GElf_Sym sym;
 	char *name;
-	int index;
+	unsigned int index;
 	unsigned char bind, type;
 	enum status status;
 	union {
@@ -88,8 +89,9 @@ struct rela {
 	struct symbol *sym;
 	unsigned int type;
 	int addend;
-	int offset;
+	unsigned int offset;
 	char *string;
+	bool need_dynrela;
 };
 
 struct string {

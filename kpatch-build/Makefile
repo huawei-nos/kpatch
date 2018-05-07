@@ -1,6 +1,6 @@
 include ../Makefile.inc
 
-CFLAGS += -MMD -MP -I../kmod/patch -Iinsn -Wall -g -Werror
+CFLAGS += -MMD -MP -I../kmod/patch -Iinsn -Wall -Wsign-compare -g -Werror
 LDLIBS = -lelf
 
 TARGETS = create-diff-object create-klp-module create-kpatch-module
@@ -35,7 +35,7 @@ $(PLUGIN): gcc-plugins/ppc64le-plugin.c
 
 install: all
 	$(INSTALL) -d $(LIBEXECDIR)
-	$(INSTALL) $(TARGETS) kpatch-gcc $(PLUGIN) $(LIBEXECDIR)
+	$(INSTALL) $(TARGETS) kpatch-gcc $(LIBEXECDIR)
 	$(INSTALL) -d $(BINDIR)
 	$(INSTALL) kpatch-build $(BINDIR)
 
