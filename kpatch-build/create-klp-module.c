@@ -81,7 +81,7 @@ static struct symbol *find_or_add_ksym_to_symbols(struct kpatch_elf *kelf,
 			return sym;
 	}
 
-	ALLOC_LINK(sym, &kelf->symbols);
+	ALLOC_LINK(sym, NULL);
 	sym->name = strdup(buf);
 	if (!sym->name)
 		ERROR("strdup");
@@ -93,6 +93,25 @@ static struct symbol *find_or_add_ksym_to_symbols(struct kpatch_elf *kelf,
 	 */
 	sym->sym.st_shndx = SHN_LIVEPATCH;
 	sym->sym.st_info = GELF_ST_INFO(sym->bind, sym->type);
+	/*
+	 * Figure out where to put the new symbol:
+	 *   a) locals need to be grouped together, before globals
+	 *   b) globals can be tacked into the end of the list
+	 */
+	if (is_local_sym(sym)) {
+		struct list_head *head;
+		struct symbol *s;
+
+		head = &kelf->symbols;
+		list_for_each_entry(s, &kelf->symbols, list) {
+			if (!is_local_sym(s))
+				break;
+			head = &s->list;
+		}
+		list_add_tail(&sym->list, head);
+	} else {
+		list_add_tail(&sym->list, &kelf->symbols);
+	}
 
 	return sym;
 }
@@ -292,6 +311,27 @@ static void create_klp_arch_sections(struct kpatch_elf *kelf, char *strings)
 		 * single .klp.arch.vmlinux..parainstructions section
 		 */
 		old_size = sec->data->d_size;
+
+		/*
+		 * Due to a quirk in how .parainstructions gets linked, the
+		 * section size doesn't encompass the last 4 bytes of the last
+		 * entry.  Align the old size properly before merging.
+		 */
+		if (!strcmp(base->name, ".parainstructions")) {
+			char *str;
+			static int align_mask = 0;
+
+			if (!align_mask) {
+				str = getenv("PARA_STRUCT_SIZE");
+				if (!str)
+					ERROR("PARA_STRUCT_SIZE not set");
+
+				align_mask = atoi(str) - 1;
+			}
+
+			old_size = (old_size + align_mask) & ~align_mask;
+		}
+
 		new_size = old_size + base->data->d_size;
 		sec->data->d_buf = realloc(sec->data->d_buf, new_size);
 		sec->data->d_size = new_size;

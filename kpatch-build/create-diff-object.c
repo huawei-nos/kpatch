@@ -509,6 +509,72 @@ static int kpatch_line_macro_change_only(struct section *sec)
 
 	return 1;
 }
+#elif __powerpc__
+#define PPC_INSTR_LEN 4
+#define PPC_RA_OFFSET 16
+
+static int kpatch_line_macro_change_only(struct section *sec)
+{
+	unsigned long start1, start2, size, offset;
+	unsigned int instr1, instr2;
+	struct rela *rela;
+	int lineonly = 0, found;
+
+	if (sec->status != CHANGED ||
+	    is_rela_section(sec) ||
+	    !is_text_section(sec) ||
+	    sec->sh.sh_size != sec->twin->sh.sh_size ||
+	    !sec->rela ||
+	    sec->rela->status != SAME)
+		return 0;
+
+	start1 = (unsigned long)sec->twin->data->d_buf;
+	start2 = (unsigned long)sec->data->d_buf;
+	size = sec->sh.sh_size;
+	for (offset = 0; offset < size; offset += PPC_INSTR_LEN) {
+		if (!memcmp((void *)start1 + offset, (void *)start2 + offset,
+			    PPC_INSTR_LEN))
+			continue;
+
+		instr1 = *(unsigned int *)(start1 + offset) >> PPC_RA_OFFSET;
+		instr2 = *(unsigned int *)(start2 + offset) >> PPC_RA_OFFSET;
+
+		/* verify it's a load immediate to r5 */
+		if (!(instr1 == 0x38a0 && instr2 == 0x38a0))
+			return 0;
+
+		found = 0;
+		list_for_each_entry(rela, &sec->rela->relas, list) {
+			if (rela->offset < offset + PPC_INSTR_LEN)
+				continue;
+			if (toc_rela(rela) && toc_rela(rela)->string)
+				continue;
+			if (!strncmp(rela->sym->name, "__warned.", 9))
+				continue;
+			if (!strncmp(rela->sym->name, "warn_slowpath_", 14) ||
+			   (!strcmp(rela->sym->name, "__warn_printk")) ||
+			   (!strcmp(rela->sym->name, "__might_sleep")) ||
+			   (!strcmp(rela->sym->name, "___might_sleep")) ||
+			   (!strcmp(rela->sym->name, "__might_fault")) ||
+			   (!strcmp(rela->sym->name, "printk")) ||
+			   (!strcmp(rela->sym->name, "lockdep_rcu_suspicious"))) {
+				found = 1;
+				break;
+			}
+			return 0;
+		}
+		if (!found)
+			return 0;
+
+		lineonly = 1;
+	}
+
+	if (!lineonly)
+		ERROR("no instruction changes detected for changed section %s",
+		      sec->name);
+
+	return 1;
+}
 #else
 static int kpatch_line_macro_change_only(struct section *sec)
 {
@@ -2401,8 +2467,17 @@ static int function_ptr_rela(const struct rela *rela)
 
 static int may_need_dynrela(const struct rela *rela)
 {
+	/*
+	 * References to .TOC. are treated specially by the module loader and
+	 * should never be converted to dynrelas.
+	 */
+	if (rela->type == R_PPC64_REL16_HA || rela->type == R_PPC64_REL16_LO ||
+	    rela->type == R_PPC64_REL64)
+		return 0;
+
 	if (!rela->sym->sec)
 		return 1;
+
 	/*
 	 * Nested functions used as callbacks are a special case.
 	 * They are not supposed to be visible outside of the
@@ -2918,11 +2993,11 @@ static void kpatch_build_strings_section_data(struct kpatch_elf *kelf)
 }
 
 struct arguments {
-	char *args[6];
+	char *args[7];
 	int debug;
 };
 
-static char args_doc[] = "original.o patched.o kernel-object output.o Module.symvers patch-module-name";
+static char args_doc[] = "original.o patched.o parent-name parent-symtab Module.symvers patch-module-name output.o";
 
 static struct argp_option options[] = {
 	{"debug", 'd', NULL, 0, "Show debug output" },
@@ -2941,13 +3016,13 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state)
 			arguments->debug = 1;
 			break;
 		case ARGP_KEY_ARG:
-			if (state->arg_num >= 6)
+			if (state->arg_num >= 7)
 				/* Too many arguments. */
 				argp_usage (state);
 			arguments->args[state->arg_num] = arg;
 			break;
 		case ARGP_KEY_END:
-			if (state->arg_num < 6)
+			if (state->arg_num < 7)
 				/* Not enough arguments. */
 				argp_usage (state);
 			break;
@@ -2967,8 +3042,8 @@ int main(int argc, char *argv[])
 	struct lookup_table *lookup;
 	struct section *sec, *symtab;
 	struct symbol *sym;
-	char *hint = NULL, *objname, *pos;
-	char *mod_symvers_path, *pmod_name;
+	char *hint = NULL, *orig_obj, *patched_obj, *parent_name;
+	char *parent_symtab, *mod_symvers, *patch_name, *output_obj;
 	struct sym_compare_type *base_locals;
 
 	arguments.debug = 0;
@@ -2978,13 +3053,18 @@ int main(int argc, char *argv[])
 
 	elf_version(EV_CURRENT);
 
-	childobj = basename(arguments.args[0]);
+	orig_obj      = arguments.args[0];
+	patched_obj   = arguments.args[1];
+	parent_name   = arguments.args[2];
+	parent_symtab = arguments.args[3];
+	mod_symvers   = arguments.args[4];
+	patch_name    = arguments.args[5];
+	output_obj    = arguments.args[6];
 
-	mod_symvers_path = arguments.args[4];
-	pmod_name = arguments.args[5];
+	childobj = basename(orig_obj);
 
-	kelf_base = kpatch_elf_open(arguments.args[0]);
-	kelf_patched = kpatch_elf_open(arguments.args[1]);
+	kelf_base = kpatch_elf_open(orig_obj);
+	kelf_patched = kpatch_elf_open(patched_obj);
 
 	kpatch_bundle_symbols(kelf_base);
 	kpatch_bundle_symbols(kelf_patched);
@@ -3004,7 +3084,7 @@ int main(int argc, char *argv[])
 
 	/* create symbol lookup table */
 	base_locals = kpatch_elf_locals(kelf_base);
-	lookup = lookup_open(arguments.args[2], mod_symvers_path, hint, base_locals);
+	lookup = lookup_open(parent_symtab, mod_symvers, hint, base_locals);
 	free(base_locals);
 
 	kpatch_mark_grouped_sections(kelf_patched);
@@ -3062,27 +3142,12 @@ int main(int argc, char *argv[])
 	 */
 	kpatch_elf_teardown(kelf_patched);
 
-	/* extract module name (destructive to arguments.modulefile) */
-	objname = basename(arguments.args[2]);
-	if (!strncmp(objname, "vmlinux-", 8))
-		objname = "vmlinux";
-	else {
-		pos = strchr(objname,'.');
-		if (pos) {
-			/* kernel module */
-			*pos = '\0';
-			pos = objname;
-			while ((pos = strchr(pos, '-')))
-				*pos++ = '_';
-		}
-	}
-
 	/* create strings, patches, and dynrelas sections */
 	kpatch_create_strings_elements(kelf_out);
-	kpatch_create_patches_sections(kelf_out, lookup, objname);
-	kpatch_create_intermediate_sections(kelf_out, lookup, objname, pmod_name);
-	kpatch_create_kpatch_arch_section(kelf_out, objname);
-	kpatch_create_callbacks_objname_rela(kelf_out, objname);
+	kpatch_create_patches_sections(kelf_out, lookup, parent_name);
+	kpatch_create_intermediate_sections(kelf_out, lookup, parent_name, patch_name);
+	kpatch_create_kpatch_arch_section(kelf_out, parent_name);
+	kpatch_create_callbacks_objname_rela(kelf_out, parent_name);
 	kpatch_build_strings_section_data(kelf_out);
 
 	kpatch_create_mcount_sections(kelf_out);
@@ -3116,7 +3181,7 @@ int main(int argc, char *argv[])
 	kpatch_create_strtab(kelf_out);
 	kpatch_create_symtab(kelf_out);
 	kpatch_dump_kelf(kelf_out);
-	kpatch_write_output_elf(kelf_out, kelf_patched->elf, arguments.args[3]);
+	kpatch_write_output_elf(kelf_out, kelf_patched->elf, output_obj);
 
 	kpatch_elf_free(kelf_patched);
 	kpatch_elf_teardown(kelf_out);
