@@ -170,7 +170,7 @@ static void kpatch_bundle_symbols(struct kpatch_elf *kelf)
 		if (is_bundleable(sym)) {
 			if (sym->sym.st_value != 0 &&
 			    !is_gcc6_localentry_bundled_sym(sym)) {
-				ERROR("symbol %s at offset %lu within section %s, expected 0",
+				ERROR("symbol %s at offset %llu within section %s, expected 0",
 				      sym->name, sym->sym.st_value,
 				      sym->sec->name);
 			}
