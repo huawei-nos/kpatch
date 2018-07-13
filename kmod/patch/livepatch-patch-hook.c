@@ -47,11 +47,13 @@
 #define HAVE_SYMPOS
 #endif
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0) &&			\
-     LINUX_VERSION_CODE <= KERNEL_VERSION(4, 15, 0)) ||			\
-     (defined(RHEL_RELEASE_CODE) &&					\
-      RHEL_RELEASE_CODE <= RHEL_RELEASE_VERSION(7, 5))
-#define HAVE_IMMEDIATE
+#ifdef RHEL_RELEASE_CODE
+# if RHEL_RELEASE_CODE <= RHEL_RELEASE_VERSION(7, 5)
+#  define HAVE_IMMEDIATE
+# endif
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0) &&		\
+       LINUX_VERSION_CODE <= KERNEL_VERSION(4, 15, 0))
+# define HAVE_IMMEDIATE
 #endif
 
 #ifdef RHEL_RELEASE_CODE
@@ -373,7 +375,7 @@ static int __init patch_init(void)
 		goto out;
 	lpatch->mod = THIS_MODULE;
 	lpatch->objs = lobjects;
-#if defined(__powerpc__) && defined(HAVE_IMMEDIATE)
+#if defined(__powerpc64__) && defined(HAVE_IMMEDIATE)
 	lpatch->immediate = true;
 #endif
 

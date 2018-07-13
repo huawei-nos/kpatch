@@ -52,14 +52,15 @@
 #include "kpatch-patch.h"
 #include "kpatch-elf.h"
 #include "kpatch-intermediate.h"
+#include "kpatch.h"
 
 #define DIFF_FATAL(format, ...) \
 ({ \
 	fprintf(stderr, "ERROR: %s: " format "\n", childobj, ##__VA_ARGS__); \
-	error(2, 0, "unreconcilable difference"); \
+	error(EXIT_STATUS_DIFF_FATAL, 0, "unreconcilable difference"); \
 })
 
-#ifdef __powerpc__
+#ifdef __powerpc64__
 #define ABSOLUTE_RELA_TYPE R_PPC64_ADDR64
 #else
 #define ABSOLUTE_RELA_TYPE R_X86_64_64
@@ -90,7 +91,9 @@ static int is_bundleable(struct symbol *sym)
 
 	if (sym->type == STT_FUNC &&
 	    !strncmp(sym->sec->name, ".text.unlikely.",15) &&
-	    !strcmp(sym->sec->name + 15, sym->name))
+	    (!strcmp(sym->sec->name + 15, sym->name) ||
+			 (strstr(sym->name, ".cold.") &&
+			  !strncmp(sym->sec->name + 15, sym->name, strlen(sym->sec->name) - 15))))
 		return 1;
 
 	if (sym->type == STT_OBJECT &&
@@ -111,7 +114,7 @@ static int is_bundleable(struct symbol *sym)
 	return 0;
 }
 
-#ifdef __powerpc__
+#ifdef __powerpc64__
 /* Symbol st_others value for powerpc */
 #define STO_PPC64_LOCAL_BIT     5
 #define STO_PPC64_LOCAL_MASK    (7 << STO_PPC64_LOCAL_BIT)
@@ -253,7 +256,7 @@ static int kpatch_mangled_strcmp(char *s1, char *s2)
 static int rela_equal(struct rela *rela1, struct rela *rela2)
 {
 	struct rela *rela_toc1, *rela_toc2;
-	unsigned long toc_data1, toc_data2;
+	unsigned long toc_data1 = 0, toc_data2 = 0; /* = 0 to prevent gcc warning */
 
 	if (rela1->type != rela2->type ||
 	    rela1->offset != rela2->offset)
@@ -372,8 +375,9 @@ static void kpatch_compare_correlated_section(struct section *sec)
 	/* Compare section headers (must match or fatal) */
 	if (sec1->sh.sh_type != sec2->sh.sh_type ||
 	    sec1->sh.sh_flags != sec2->sh.sh_flags ||
-	    sec1->sh.sh_addralign != sec2->sh.sh_addralign ||
-	    sec1->sh.sh_entsize != sec2->sh.sh_entsize)
+	    sec1->sh.sh_entsize != sec2->sh.sh_entsize ||
+	    (sec1->sh.sh_addralign != sec2->sh.sh_addralign &&
+	     !is_text_section(sec1)))
 		DIFF_FATAL("%s section header details differ", sec1->name);
 
 	/* Short circuit for mcount sections, we rebuild regardless */
@@ -509,7 +513,7 @@ static int kpatch_line_macro_change_only(struct section *sec)
 
 	return 1;
 }
-#elif __powerpc__
+#elif __powerpc64__
 #define PPC_INSTR_LEN 4
 #define PPC_RA_OFFSET 16
 
@@ -823,6 +827,7 @@ static void kpatch_rename_mangled_functions(struct kpatch_elf *base,
 
 		if (!strstr(sym->name, ".isra.") &&
 		    !strstr(sym->name, ".constprop.") &&
+		    !strstr(sym->name, ".cold.") &&
 		    !strstr(sym->name, ".part."))
 			continue;
 
@@ -1201,7 +1206,7 @@ static void kpatch_replace_sections_syms(struct kpatch_elf *kelf)
 				continue;
 			}
 
-#ifdef __powerpc__
+#ifdef __powerpc64__
 			add_off = 0;
 #else
 			if (rela->type == R_X86_64_PC32) {
@@ -1724,7 +1729,7 @@ static int smp_locks_group_size(struct kpatch_elf *kelf, int offset)
 	return 4;
 }
 #endif
-#ifdef __powerpc__
+#ifdef __powerpc64__
 static int fixup_entry_group_size(struct kpatch_elf *kelf, int offset)
 {
 	static int size = 0;
@@ -1823,7 +1828,7 @@ static struct special_section special_sections[] = {
 		.group_size	= altinstructions_group_size,
 	},
 #endif
-#ifdef __powerpc__
+#ifdef __powerpc64__
 	{
 		.name		= "__ftr_fixup",
 		.group_size	= fixup_entry_group_size,
@@ -1993,6 +1998,94 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
 	 */
 	sec->base->data->d_buf = dest;
 	sec->base->data->d_size = dest_offset;
+}
+
+#define ORC_IP_PTR_SIZE 4
+
+/*
+ * This function is similar to kpatch_regenerate_special_section(), but
+ * customized for the ORC-related sections.  ORC is more special than the other
+ * special sections because each ORC entry is split into .orc_unwind (struct
+ * orc_entry) and .orc_unwind_ip.
+ */
+static void kpatch_regenerate_orc_sections(struct kpatch_elf *kelf)
+{
+	struct rela *rela, *safe;
+	char *src, *dest, *str;
+	unsigned int src_idx = 0, dest_idx = 0, orc_entry_size;
+	struct section *orc_sec, *ip_sec;
+
+
+	str = getenv("ORC_STRUCT_SIZE");
+	if (!str)
+		return;
+	orc_entry_size = atoi(str);
+
+	LIST_HEAD(newrelas);
+
+	orc_sec = find_section_by_name(&kelf->sections, ".orc_unwind");
+	ip_sec  = find_section_by_name(&kelf->sections, ".orc_unwind_ip");
+
+	if (!orc_sec || !ip_sec)
+		return;
+
+	if (orc_sec->sh.sh_size % orc_entry_size != 0)
+		ERROR("bad .orc_unwind size");
+
+	if (ip_sec->sh.sh_size !=
+	    (orc_sec->sh.sh_size / orc_entry_size) * ORC_IP_PTR_SIZE)
+		ERROR(".orc_unwind/.orc_unwind_ip size mismatch");
+
+	src = orc_sec->data->d_buf;
+	dest = malloc(orc_sec->sh.sh_size);
+	if (!dest)
+		ERROR("malloc");
+
+	list_for_each_entry_safe(rela, safe, &ip_sec->rela->relas, list) {
+
+		if (rela->sym->type != STT_FUNC || !rela->sym->sec->include)
+			goto next;
+
+		/* copy orc entry */
+		memcpy(dest + (dest_idx * orc_entry_size),
+		       src + (src_idx * orc_entry_size),
+		       orc_entry_size);
+
+		/* move ip rela */
+		list_del(&rela->list);
+		list_add_tail(&rela->list, &newrelas);
+		rela->offset = dest_idx * ORC_IP_PTR_SIZE;
+		rela->sym->include = 1;
+
+		dest_idx++;
+next:
+		src_idx++;
+	}
+
+	if (!dest_idx) {
+		/* no changed or global functions referenced */
+		orc_sec->status = ip_sec->status = ip_sec->rela->status = SAME;
+		orc_sec->include = ip_sec->include = ip_sec->rela->include = 0;
+		free(dest);
+		return;
+	}
+
+	/* overwrite with new relas list */
+	list_replace(&newrelas, &ip_sec->rela->relas);
+
+	/* include the sections */
+	orc_sec->include = ip_sec->include = ip_sec->rela->include = 1;
+
+	/*
+	 * Update data buf/size.
+	 *
+	 * The ip section can keep its old (zeroed data), though its size has
+	 * possibly decreased.  The ip rela section's data buf and size will be
+	 * regenerated in kpatch_rebuild_rela_section_data().
+	 */
+	orc_sec->data->d_buf = dest;
+	orc_sec->data->d_size = dest_idx * orc_entry_size;
+	ip_sec->data->d_size = dest_idx * ORC_IP_PTR_SIZE;
 }
 
 static void kpatch_check_relocations(struct kpatch_elf *kelf)
@@ -2275,6 +2368,8 @@ static void kpatch_process_special_sections(struct kpatch_elf *kelf)
 			sec->rela->include = 0;
 		}
 	}
+
+	kpatch_regenerate_orc_sections(kelf);
 }
 
 static struct sym_compare_type *kpatch_elf_locals(struct kpatch_elf *kelf)
@@ -2633,7 +2728,7 @@ static void kpatch_create_intermediate_sections(struct kpatch_elf *kelf,
 				 * a global symbol.  Use a normal rela for
 				 * exported symbols and a dynrela otherwise.
 				 */
-#ifdef __powerpc__
+#ifdef __powerpc64__
 				/*
 				 * An exported symbol might be local to an
 				 * object file and any access to the function
@@ -2832,7 +2927,7 @@ static void kpatch_create_callbacks_objname_rela(struct kpatch_elf *kelf, char *
 	}
 }
 
-#ifdef __powerpc__
+#ifdef __powerpc64__
 void kpatch_create_mcount_sections(struct kpatch_elf *kelf) { }
 #else
 /*
@@ -3079,8 +3174,10 @@ int main(int argc, char *argv[])
 			break;
 		}
 	}
-	if (!hint)
-		ERROR("FILE symbol not found in base. Stripped?\n");
+	if (!hint) {
+		log_normal("WARNING: FILE symbol not found in base. Stripped object file or assembly source?\n");
+		return EXIT_STATUS_NO_CHANGE;
+	}
 
 	/* create symbol lookup table */
 	base_locals = kpatch_elf_locals(kelf_base);
@@ -3127,7 +3224,7 @@ int main(int argc, char *argv[])
 			log_debug("no changed functions were found, but callbacks exist\n");
 		else {
 			log_debug("no changed functions were found\n");
-			return 3; /* 1 is ERROR, 2 is DIFF_FATAL */
+			return EXIT_STATUS_NO_CHANGE;
 		}
 	}
 
@@ -3187,5 +3284,5 @@ int main(int argc, char *argv[])
 	kpatch_elf_teardown(kelf_out);
 	kpatch_elf_free(kelf_out);
 
-	return 0;
+	return EXIT_STATUS_SUCCESS;
 }
