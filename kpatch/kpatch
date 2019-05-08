@@ -25,7 +25,7 @@
 
 INSTALLDIR=/var/lib/kpatch
 SCRIPTDIR="$(readlink -f "$(dirname "$(type -p "$0")")")"
-VERSION="0.6.2"
+VERSION="0.6.3"
 POST_ENABLE_WAIT=15	# seconds
 POST_SIGNAL_WAIT=60	# seconds
 
@@ -126,7 +126,7 @@ find_core_module() {
 }
 
 core_loaded () {
-	grep -q -e "T klp_register_patch" -e "T kpatch_register" /proc/kallsyms
+	grep -q -e "T klp_enable_patch" -e "T kpatch_register" /proc/kallsyms
 }
 
 get_module_name () {
